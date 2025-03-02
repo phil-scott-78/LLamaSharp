@@ -1,3 +1,4 @@
+using System.Collections.Immutable;
 using System.Text;
 using LLama.Batched;
 using LLama.Common;
@@ -10,18 +11,24 @@ namespace LLama.Examples.Examples;
 public class BatchedExecutorBoolQ
 {
     // Answers may start with a space, and then must produce one of the listed strings followed by a newline character and nothing else.
-    private static readonly Grammar AnswerGrammar = new("root ::= (\" \")? (\"true\" | \"false\" | \"yes\" | \"no\") \"\\n\"", "root");
+    private static readonly Grammar AnswerGrammar =
+        new("""
+            root ::= answer whitespace?
+
+            answer ::= "true" | "false" | "yes" | "no"
+
+            whitespace ::= [ \t\n\r]+
+            """, "root");
 
     public static async Task Run()
     {
         // Load model weights
         var parameters = new ModelParams(UserSettings.GetModelPath());
+        
         using var model = await LLamaWeights.LoadFromFileAsync(parameters);
 
-        const int tokensGenerate = 8;
-        var batchSize = AnsiConsole.Ask("How many parallel conversations to evaluate in a batch", 64);
+        var requestedMaxActive = AnsiConsole.Ask("How many parallel conversations to evaluate in a batch", 64);
         var sys = AnsiConsole.Ask("System prompt", "Answer the question with a single word answer.");
-        var hint = AnsiConsole.Ask("Provide hints to model (test reading comprehension instead of knowledge)", true);
 
         // Create an executor that can evaluate a batch of conversations together
         using var executor = new BatchedExecutor(model, parameters);
@@ -41,33 +48,118 @@ public class BatchedExecutorBoolQ
         if (data.Count > limit)
             data = data.Take(limit).ToList();
 
-        // Process data in batches
-        var chunks = data.Chunk(batchSize).ToArray();
-        var results = new List<BatchResult>();
-        await AnsiConsole.Progress()
-                         .Columns(new SpinnerColumn(Spinner.Known.Dots8Bit), new PercentageColumn(), new ProgressBarColumn(), new RemainingTimeColumn())
-                         .StartAsync(async ctx =>
+        var queue = new Queue<(string, bool, string)>(data);
+
+        // Dynamic management of max active conversations based on KV slot availability
+        var currentMaxActiveSize = requestedMaxActive; // Start with maximum of requestedMaxActive, but will reduce if we hit NoKvSlot errors
+        var activeConversations = ImmutableList.Create<ConversationRunner>();
+        
+        // storing the number of times the model gets the question right, with 
+        // separate counters for when the answer was true vs false
+        int truePositive = 0, trueNegative = 0, falsePositive = 0, falseNegative = 0;
+
+        NativeLogConfig.llama_log_set((level, message) => {});
+
+        await AnsiConsole.Live(new Table()).StartAsync(async ctx =>
         {
-            var reporter = ctx.AddTask("Processing Chunks", maxValue: chunks.Length);
-
-            foreach (var chunk in chunks)
+            while (queue.Count > 0 || activeConversations.Any(d => !d.IsFinished))
             {
-                var result = await RunBatch(executor, tokensGenerate, sys, hint, chunk);
-                results.Add(result);
+                // Only add new conversations if we haven't reached KV limits or if we have no active conversations
+                if (queue.Count > 0 && activeConversations.Count < currentMaxActiveSize)
+                {
+                    for (var i = activeConversations.Count; i < currentMaxActiveSize; i++)
+                    {
+                        if (!queue.TryDequeue(out var runner)) continue;
+                        var (question, answer, hint) = runner;
+                        var conversationData = new ConversationRunner(executor, sys, question, answer, hint);
+                        activeConversations = activeConversations.Add(conversationData);
+                    }
+                }
+                
 
-                reporter.Increment(1);
+                var decodeResult = await executor.Infer();
 
-                AnsiConsole.MarkupLineInterpolated($"[green]{result.TruePositive + result.TrueNegative}[/] / [red]{chunk.Length}[/] ({result.Accuracy:P})");
+                if (decodeResult == DecodeResult.NoKvSlot)
+                {
+                    // Reduce the maxActive limit to prevent hitting the limit again
+                    // Ensure we don't go below 1 as we need at least one conversation
+                    currentMaxActiveSize = Math.Max(1, activeConversations.Count - 1);
+                    
+                    // Handle the NoKvSlot error by selecting a conversation to dispose
+                    if (activeConversations.Count > 0)
+                    {
+                        var conversationToDispose = activeConversations
+                            .OrderByDescending(c => c.TokensGenerated)
+                            .First();
+
+                        // Get the original prompt to add back to the queue
+                        var promptToRequeue = (conversationToDispose.Question, conversationToDispose.Answer,
+                            conversationToDispose.Hint);
+
+                        // Add it back to the queue
+                        queue.Enqueue(promptToRequeue);
+
+                        // Dispose the conversation
+                        conversationToDispose.Dispose();
+
+                        // Remove from active conversations list
+                        activeConversations = activeConversations.Remove(conversationToDispose);
+
+                        // Continue to next iteration to process the modified active conversations
+                        continue;
+                    }
+                }
+                else if (decodeResult == DecodeResult.Error)
+                {
+                    throw new Exception("Unknown error occurred while inferring.");
+                }
+
+                foreach (var conversationData in activeConversations.Where(conversationData => !conversationData.IsFinished))
+                {
+                    conversationData.Sample();
+                    conversationData.Prompt();
+                    ctx.UpdateTarget(BuildStatusTable(name, executor, queue, activeConversations, truePositive, trueNegative, falsePositive, falseNegative));
+                }
+
+                if (activeConversations.Any(i => i.IsFinished))
+                {
+                    foreach (var item in activeConversations.Where(i => i.IsFinished))
+                    {
+                        item.Result(ref truePositive, ref trueNegative, ref falsePositive, ref falseNegative);
+                        item.Dispose();
+                    }
+
+                    // remove all completed conversations from the list.
+                    activeConversations = activeConversations.RemoveAll(i => i.IsFinished);
+                }
+                
+                ctx.UpdateTarget(BuildStatusTable(name, executor, queue, activeConversations, truePositive, trueNegative, falsePositive, falseNegative));
             }
         });
+    }
 
-        // Print final results
-        var correct = (from result in results select result.Correct).Sum();
-        var total = data.Count;
-        var accuracy = (float)correct / total;
-        AnsiConsole.WriteLine();
-        AnsiConsole.MarkupInterpolated($"Final Result: [green]{correct}[/] / [red]{total}[/] ({accuracy:P})");
+    private static LLamaKvCacheViewSafeHandle? _debugView;
+    private static Table BuildStatusTable(string model, BatchedExecutor executor, Queue<(string, bool, string)> queue, ImmutableList<ConversationRunner> activeConversations, int tp, int tn, int fp, int fn)
+    {
+        if (_debugView == null)
+        {
+            _debugView = executor.Context.NativeHandle.KvCacheGetDebugView();
+        }
+        else
+        {
+            _debugView.Update();
+        }
 
+        return new Table()
+                
+            .AddColumns("Key", "Value")
+            .AddRow("Model", model)
+            .AddRow("Remaining Questions", queue.Count.ToString())
+            .AddRow("Active Conversations", activeConversations.Count.ToString())
+            .AddRow("Correct", $"[green]{tp + fp}[/]")
+            .AddRow("Incorrect", $"[red]{tn + fn}[/]")
+            .AddRow("KV Cache Cells (Used/Total)", _debugView.UsedCellCount + "/" + _debugView.CellCount )
+            ;
     }
 
     private static IEnumerable<(string, bool, string)> LoadData(string path)
@@ -86,56 +178,8 @@ public class BatchedExecutorBoolQ
         }
     }
 
-    private static async Task<BatchResult> RunBatch(BatchedExecutor executor, int maxTokens, string sys, bool hint, IEnumerable<(string, bool, string)> batch)
-    {
-        var conversations = (from item in batch
-                             select new ConversationRunner(executor, sys, item.Item1, item.Item2, hint ? item.Item3 : null)).ToArray();
-
-        for (var i = 0; i < maxTokens; i++)
-        {
-            if (executor.BatchQueueCount > 1)
-                AnsiConsole.MarkupLineInterpolated($"Batch Queue: {executor.BatchQueueCount} ({i})");
-
-            // Process the entire queue of batching waiting to be processed
-            while (executor.BatchQueueCount > 0)
-            {
-                var result = await executor.Infer();
-                if (result != DecodeResult.Ok)
-                    throw new NotImplementedException($"Decode failed: {result}");
-
-                foreach (var item in conversations)
-                    item.Sample();
-            }
-
-            // Prompt each conversation that just sampled a token
-            foreach (var item in conversations)
-                item.Prompt();
-        }
-
-        int tp = 0, tn = 0, fp = 0, fn = 0;
-        foreach (var item in conversations)
-        {
-            item.Result(ref tp, ref tn, ref fp, ref fn);
-            item.Dispose();
-        }
-
-        return new BatchResult(tp, tn, fp, fn);
-    }
-
-    private record BatchResult(int TruePositive, int TrueNegative, int FalsePositive, int FalseNegative)
-    {
-        public int Correct => TruePositive + TrueNegative;
-        public int Incorrect => FalsePositive + FalseNegative;
-
-        public int TotalPositives = TruePositive + FalseNegative;
-        public int TotalNegatives = TrueNegative + FalsePositive;
-        public int Total => Correct + Incorrect;
-
-        public float Accuracy => (float)Correct / Total;
-    }
-
     /// <summary>
-    /// All of the mechanics necessary to run a conversation to answer a single question
+    /// All the mechanics necessary to run a conversation to answer a single question
     /// </summary>
     private class ConversationRunner
         : IDisposable
@@ -145,29 +189,37 @@ public class BatchedExecutorBoolQ
         private readonly ISamplingPipeline _sampler;
 
         private readonly Conversation _conversation;
-        private bool _finished;
         private LLamaToken? _sampledToken;
 
         public string Question { get; }
         public bool Answer { get; }
+        public string Hint { get; }
+        public bool IsFinished { get; private set; }
 
-        public ConversationRunner(BatchedExecutor executor, string sys, string question, bool answer, string? hint)
+        public int TokensGenerated { get; private set; }
+
+        public ConversationRunner(BatchedExecutor executor, string sys, string question, bool answer, string hint)
         {
             _executor = executor;
             _decoder = new StreamingTokenDecoder(executor.Context);
-            _sampler = new GreedySamplingPipeline { Grammar = AnswerGrammar };
+            _sampler = new DefaultSamplingPipeline
+            {
+                Grammar = AnswerGrammar, 
+                GrammarOptimization = DefaultSamplingPipeline.GrammarOptimizationMode.Extended
+            };
 
             // Make sure question ends with question mark
             if (!question.EndsWith('?'))
                 question += '?';
 
-            // Prepend hint if necessary
-            if (hint != null)
-            {
-                if (!hint.EndsWith('.'))
-                    hint += '.';
-                question = $"{hint}\n{question}";
-            }
+
+            Question = question;
+            Answer = answer;
+            Hint = hint;
+
+            if (!hint.EndsWith('.'))
+                hint += '.';
+            question = $"{hint}\n{question}\nAnswer with Yes or No based .";
 
             // Template the question
             var template = new LLamaTemplate(executor.Model);
@@ -178,26 +230,27 @@ public class BatchedExecutorBoolQ
 
             // Prompt
             _conversation = executor.Create();
-            _conversation.Prompt(_executor.Context.Tokenize(templatedQuestion, special: true));
-
-            Question = question;
-            Answer = answer;
+            var tokenizedPrompt = _executor.Context.Tokenize(templatedQuestion, special: true, addBos: true);
+            TokensGenerated += tokenizedPrompt.Length;
+            _conversation.Prompt(tokenizedPrompt);
         }
 
         public void Sample()
         {
-            if (_finished)
+            if (IsFinished)
                 return;
             if (!_conversation.RequiresSampling)
                 return;
 
-            var token = _sampler.Sample(_executor.Context, _conversation.GetSampleIndex());
+            var token = _conversation.Sample(_sampler);
+
+            TokensGenerated++;
 
             var vocab = _executor.Context.Vocab;
             if (token.IsEndOfGeneration(vocab) || vocab.Newline == token)
             {
                 _sampledToken = default;
-                _finished = true;
+                IsFinished = true;
             }
             else
             {
@@ -207,7 +260,7 @@ public class BatchedExecutorBoolQ
 
         public void Prompt()
         {
-            if (_finished)
+            if (IsFinished)
                 return;
             if (!_sampledToken.HasValue)
                 return;
@@ -215,7 +268,6 @@ public class BatchedExecutorBoolQ
             var token = _sampledToken.Value;
             _sampledToken = default;
 
-            _sampler.Accept(token);
             _decoder.Add(token);
             _conversation.Prompt(token);
         }
